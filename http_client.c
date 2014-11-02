@@ -19,7 +19,9 @@
 #include "list.h"
 #include "coroutine.h"
 
-#define CALLER_CACHES 256
+#define CALLER_CACHES   256
+#define HTTPBUF_CACHES  600
+#define HTTP_BUF_SIZE 1024
 
 struct _http_context;
 struct _http_mgmt;
@@ -33,12 +35,8 @@ typedef enum _CALLING_STATUS {
 
 typedef enum _CALLER_STATUS
 {
-    /* 执行结束，可返回主线程 */
     CALLER_FINISH = 0,
-
-    /* 等待消息再执行 */
     CALLER_PENDING,
-
     CALLER_CONTINUE
 
 } CALLER_STATUS;
@@ -49,12 +47,33 @@ typedef enum _CALLING_PRIO {
     CALLING_PRIO_COUNT
 } CALLING_PRIO;
 
+typedef enum _CALLER_STATE {
+    CALLER_STATE_CONNECT = 0,
+    CALLER_STATE_WRITE,
+    CALLER_STATE_READ
+} CALLER_STATE;
+
+typedef struct _http_buf_info {
+    struct list_head    node;
+    char                buf[HTTP_BUF_SIZE];
+    int                 start;
+    int                 len;
+    int                 total_len;
+} http_buf_info;
+
+typedef struct _http_buf {
+    struct list_head    list_done;
+    struct list_head    list_todo;
+    http_buf_info*      curr;       //The current node is always in list_todo
+} http_buf;
+
 typedef struct _http_context {
     struct ccrContextTag    context;
 
     struct list_head        node;
     struct list_head        node_time;
     CALLING_STATUS          status;
+    CALLER_STATE            state;
     ASYNC_FUNC              func_run;
     int                     prio;
     void*                   args;
@@ -65,6 +84,9 @@ typedef struct _http_context {
     int                     sockfd;
     char                    hostname[128];
     int                     revents;
+
+    http_buf                buf_read;
+    http_buf                buf_write;
 } http_context;
 
 
@@ -87,10 +109,14 @@ typedef struct _http_mgmt {
     int                     count_pollfds;
     http_context**          http_lookup;
     struct list_head        ctx_caches;
+    struct list_head        http_buf_caches;
 } http_mgmt;
 
 // declare funcs
 void http_context_release(http_mgmt* mgmt, http_context* ctx);
+int http_context_connect(http_mgmt* mgmt, http_context* ctx);
+int http_context_write(http_mgmt* mgmt, http_context* ctx);
+int http_context_read(http_mgmt* mgmt, http_context* ctx);
 
 // Utils functions. move to the other file?
 static unsigned long name_resolve(char *host_name)
@@ -113,6 +139,7 @@ int http_mgmt_init(http_mgmt* mgmt)
 {
     int i;
     http_context* ctx;
+    http_buf_info* buf_info;
 
     assert(NULL != mgmt);
 
@@ -142,6 +169,18 @@ int http_mgmt_init(http_mgmt* mgmt)
     INIT_LIST_HEAD(&mgmt->ctx_caches);
     for(i = 0; i < CALLER_CACHES; i++) {
         list_add(&ctx[i].node, &mgmt->ctx_caches);
+    }
+
+    buf_info = (http_buf_info*)calloc(HTTPBUF_CACHES, sizeof(http_buf_info));
+    if(NULL == buf_info) 
+    {
+        fprintf(stderr, "alloc http_buf, out of memory\n");
+        return -1;
+    }
+    INIT_LIST_HEAD(&mgmt->http_buf_caches);
+    for(i = 0; i < HTTPBUF_CACHES; i++)
+    {
+        list_add(&buf_info[i].node, &mgmt->http_buf_caches);
     }
 
     return 0;
@@ -201,6 +240,32 @@ void free_context(http_mgmt* mgmt, http_context* ctx)
     if(NULL != ctx)
     {
         list_add(&ctx->node, &mgmt->ctx_caches);
+    }
+}
+
+http_buf_info* alloc_buf(http_mgmt* mgmt)
+{
+    http_buf_info* buf_info = NULL;
+    assert(NULL != mgmt);
+
+    if(!list_empty(&mgmt->http_buf_caches))
+    {
+        list_for_each_entry(buf_info, &mgmt->http_buf_caches, node) {
+            break;
+        } 
+        list_del(&buf_info->node);
+    }
+
+    return buf_info;
+}
+
+void free_buf(http_mgmt* mgmt, http_buf_info* buf) 
+{
+    assert(NULL != mgmt);
+
+    if(NULL != buf)
+    {
+        list_add(&buf->node, &mgmt->http_buf_caches);
     }
 }
 
@@ -267,9 +332,22 @@ int http_mgmt_service(http_mgmt* mgmt, struct pollfd* pfd)
         return -1; // params error
     }
 
+    fprintf(stderr, "revents = %x\n", pfd->revents);
+
     ctx = mgmt->http_lookup[pfd->fd];
-    ctx->revents = pfd->revents;
-    http_context_execute(mgmt, ctx);
+    if(NULL == ctx) {
+        fprintf(stderr, "service sock error, the context has been released\n");
+        return 0;
+    }
+
+    if(pfd->revents & (POLLERR|POLLHUP)){
+        fprintf(stderr, "release context because of socket error\n");
+        http_context_release(mgmt, ctx);
+    }
+    else {
+        ctx->revents = pfd->revents;
+        http_context_execute(mgmt, ctx);
+    }
     pfd->revents = 0;
 
     return 0;
@@ -329,92 +407,167 @@ int http_mgmt_run(http_mgmt* mgmt)
 #define SERVERIP "127.0.0.1"
 #define SERVERPORT 8060
 #define MAXDATASIZE 1024
-int http_context_do(http_mgmt* mgmt, http_context* ctx)
+
+int http_context_connect(http_mgmt* mgmt, http_context* ctx)
 {
-    int numbytes, rc;
-    char buffer[MAXDATASIZE], *p;
+    int rc;
     struct sockaddr_in server_addr;
     struct pollfd* pfd;
-
-    ccrBeginContext
-        int error_code;
-    ccrEndContext(ctx);
-
-    //always run first
+    
     pfd = (struct pollfd*)ctx->pfd;
-    fprintf(stderr, "revents = %x\n", pfd->revents);
-    if(pfd->revents & (POLLERR|POLLHUP))
-    {
-        fprintf(stderr, "pollerr\n");
-        return CALLER_FINISH;
-    }
 
     ccrBegin(ctx);
 
     while(POLLOUT != pfd->revents)
     {
-        //TODO move into a function?
         memset(&server_addr, 0, sizeof(struct sockaddr));
         server_addr.sin_family = AF_INET;
         server_addr.sin_port = htons(SERVERPORT);
         server_addr.sin_addr.s_addr = name_resolve(SERVERIP);
         fprintf(stderr, "before connect\n");
         rc = connect(ctx->sockfd, (struct sockaddr*) &server_addr, sizeof(struct sockaddr));
-        if(rc < 0)
-        {
-            if((EALREADY == errno) || (EINPROGRESS == errno))
-            {
-                fprintf(stderr, "still connecting\n");
-                pfd->events |= POLLOUT;
-                ccrReturn(ctx, CALLER_CONTINUE);
-            }
-            else
-            {
-                fprintf(stderr, "connect fail'\n");
-                ccrReturn(ctx, CALLER_FINISH);
-            }
-        }
-        else
+        if(rc >= 0) 
         {
             break;
         }
+
+        if((EALREADY == errno) || (EINPROGRESS == errno))
+        {
+            pfd->events &= ~POLLIN;
+            pfd->events |= POLLOUT;
+            fprintf(stderr, "still connecting\n");
+            ccrReturn(ctx, CALLER_CONTINUE);
+        }
+        else
+        {
+            fprintf(stderr, "connect fail'\n");
+            ccrReturn(ctx, CALLER_FINISH);
+        }
     }
     // Clear pollout flag
-    pfd->events &= ~POLLOUT;
+    // pfd->events &= ~POLLOUT;
     fprintf(stderr, "connected ok\n");
 
-    p = buffer;
+    // TODO do better. Change state to write
+    ctx->state = CALLER_STATE_WRITE;
+    ctx->func_run = &http_context_write;
+    ccrFinish(ctx, CALLER_CONTINUE);
+}
+
+static http_buf_info* next_buf_info(struct list_head* list) 
+{
+    http_buf_info* buf_info = NULL;
+
+    if(!list_empty(list))
+    {
+        list_for_each_entry(buf_info, list, node) {
+            break;
+        } 
+        list_del(&buf_info->node);
+    }
+
+    return buf_info;
+}
+
+int http_context_write(http_mgmt* mgmt, http_context* ctx)
+{
+    int n;
+    char* p;
+    struct pollfd* pfd;
+    http_buf_info* buf_info;
+
+    pfd = (struct pollfd*)ctx->pfd;
+    buf_info = ctx->buf_write.curr;
+
+    ccrBegin(ctx);
+
+    buf_info = alloc_buf(mgmt);
+    memset(buf_info, 0, sizeof(*buf_info));
+    list_add(&buf_info->node, &ctx->buf_write.list_todo);
+    ctx->buf_write.curr = buf_info;
+
+    p = buf_info->buf;
     p += sprintf((char *)p,
     "GET /sample HTTP/1.1\x0d\x0a"
     "Host: %s\x0d\x0a"
     "Connection: Close\x0d\x0a"
     "Accept: text/html, image/jpeg, application/x-ms-application, */*\x0d\x0a\x0d\x0a",
     SERVERIP);
-    numbytes = (int)(p-buffer);
-    fprintf(stderr, "size=%d\n%s", numbytes, buffer);
+    buf_info->len = (int)(p-buf_info->buf);
+    buf_info->total_len = buf_info->len;
 
-    //TODO send bytes
-    if(-1 == send(ctx->sockfd, buffer, p-buffer, 0))
+    // Now write bufs
+    while(buf_info != NULL)
     {
-        fprintf(stderr, "send buffer error\n");
-        ccrReturn(ctx, CALLER_FINISH);
+        n = write(ctx->sockfd, buf_info->buf + buf_info->start, buf_info->len);
+        if(n < 0)
+        {
+            if(errno == EINTR || errno == EAGAIN) {
+                ccrReturn(ctx, CALLER_PENDING);
+            }
+            else {
+                ccrReturn(ctx, CALLER_FINISH);
+            }
+        }
+        if ((buf_info->len -= n) > 0) {
+            buf_info->start += n;
+            ccrReturn(ctx, CALLER_PENDING);
+        } else {
+            list_del(&buf_info->node);
+            list_add(&buf_info->node, &ctx->buf_write.list_done);
+            ctx->buf_write.curr = next_buf_info(&ctx->buf_write.list_todo);
+            buf_info = ctx->buf_write.curr;
+        }
     }
-    else {
-        fprintf(stderr, "send ok\n");
+
+    // Now write done, change to read state
+    pfd->events &= ~POLLOUT;
+    pfd->events |= POLLIN;
+    ctx->state = CALLER_STATE_READ;
+    ctx->func_run = &http_context_read;
+
+    //free the write bufs now
+    list_splice_init(&ctx->buf_write.list_done, &mgmt->http_buf_caches);
+    list_splice_init(&ctx->buf_write.list_todo, &mgmt->http_buf_caches);
+
+    ccrFinish(ctx, CALLER_PENDING);
+}
+
+int http_context_read(http_mgmt* mgmt, http_context* ctx)
+{
+    int n;
+    char* p;
+    struct pollfd* pfd;
+    http_buf_info* buf_info;
+
+    /* Never used like this
+     ccrBeginContext 
+        int error_code;
+    ccrEndContext(ctx); */
+
+    pfd = (struct pollfd*)ctx->pfd;
+    
+    ccrBegin(ctx);
+
+    for(;;) {
+        buf_info = alloc_buf(mgmt);
+        memset(buf_info, 0, sizeof(*buf_info));
+        list_add_tail(&buf_info->node, &ctx->buf_read.list_todo);
+
+        n = read(ctx->sockfd, buf_info->buf, HTTP_BUF_SIZE);
+        fprintf(stderr, "%s", buf_info->buf);
+        if (n > 0) {
+            buf_info->len = n;
+            buf_info->total_len = n;
+        } else if (!n || errno != EINTR && errno != EAGAIN) {
+            //read complete
+            ccrReturn(ctx, CALLER_FINISH);
+        }
         ccrReturn(ctx, CALLER_PENDING);
     }
 
-    // Get recv
-    assert(pfd->revents == POLLIN);
-    if((numbytes = recv(ctx->sockfd, buffer, MAXDATASIZE, 0)) == -1)
-    {
-        fprintf(stderr, "recv read buffer error\n");
-        ccrReturn(ctx, CALLER_FINISH);
-    }
-    buffer[numbytes] = '\0';
-    fprintf(stderr, "size=%d\n%s\n", numbytes, buffer);
-
     ccrFinish(ctx, CALLER_FINISH);
+
 }
 
 // Already delete from the list_ready, but still in the list_timeout
@@ -427,6 +580,13 @@ void http_context_release(http_mgmt* mgmt, http_context* ctx)
         mgmt_del_fd(mgmt, ctx->sockfd);
         mgmt->http_lookup[ctx->sockfd] = NULL;
     }
+
+    // Free bufs but not use free_buf hear
+    list_splice_init(&ctx->buf_write.list_done, &mgmt->http_buf_caches);
+    list_splice_init(&ctx->buf_write.list_todo, &mgmt->http_buf_caches);
+    list_splice_init(&ctx->buf_read.list_done, &mgmt->http_buf_caches);
+    list_splice_init(&ctx->buf_read.list_todo, &mgmt->http_buf_caches);
+
     list_del(&ctx->node_time);
     free_context(mgmt, ctx);
     mgmt->total_process++;
@@ -437,10 +597,15 @@ void http_context_release(http_mgmt* mgmt, http_context* ctx)
 
 int http_context_init(http_mgmt* mgmt, http_context* ctx)
 {
-    ctx->func_run = &http_context_do;
+    ctx->state = CALLER_STATE_CONNECT;
+    ctx->func_run = &http_context_connect;
     ctx->status = CALLING_READY;
     insert_ready_prio(mgmt, ctx);
     insert_timeout(mgmt, ctx);
+    INIT_LIST_HEAD(&ctx->buf_read.list_done);
+    INIT_LIST_HEAD(&ctx->buf_read.list_todo);
+    INIT_LIST_HEAD(&ctx->buf_write.list_done);
+    INIT_LIST_HEAD(&ctx->buf_write.list_todo);
     mgmt->total_add++;
 
     ctx->pfd = mgmt_add_fd(mgmt, ctx->sockfd, (POLLIN | POLLERR | POLLHUP) );
